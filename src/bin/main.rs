@@ -1,22 +1,18 @@
 use cgmath::prelude::*;
-use eframe::egui;
+use eframe::{egui, wgpu::util::DeviceExt};
+use encase::{ArrayLength, ShaderSize, ShaderType, StorageBuffer, UniformBuffer};
 use particle_life_3d::{Particle, Particles};
 use rand::prelude::*;
-use rayon::prelude::*;
+use eframe::egui_wgpu::wgpu;
+use rayon::prelude::*; // Rayon for parallelism
 use std::sync::{Arc, Mutex};
+use std::thread;
 
-const TIME_STEP: f32 = 1.0 / 60.0;
+
 const CAMERA_SPEED: f32 = 5.0;
 const CAMERA_ROTATION_SPEED: f32 = 90.0;
+const TIME_STEP: f32 = 1.0 / 60.0;
 
-#[derive(Clone, Copy)]
-struct Axes {
-    pub forward: cgmath::Vector3<f32>,
-    pub right: cgmath::Vector3<f32>,
-    pub up: cgmath::Vector3<f32>,
-}
-
-#[derive(Clone, Copy)]
 struct Camera {
     pub position: cgmath::Vector3<f32>,
     pub up: cgmath::Vector3<f32>,
@@ -24,88 +20,72 @@ struct Camera {
     pub yaw: f32,
 }
 
+struct Axes {
+    pub forward: cgmath::Vector3<f32>,
+    pub right: cgmath::Vector3<f32>,
+    pub up: cgmath::Vector3<f32>,
+}
+
 impl Camera {
-    fn new(position: cgmath::Vector3<f32>) -> Self {
-        Camera {
-            position,
-            up: cgmath::vec3(0.0, 1.0, 0.0),
-            pitch: 0.0,
-            yaw: 0.0,
-        }
-    }
-    
     pub fn get_axes(&self) -> Axes {
+        let pitch_rad = self.pitch.to_radians();
+        let yaw_rad = self.yaw.to_radians();
         let forward = cgmath::vec3(
-            self.pitch.to_radians().cos() * (-self.yaw).to_radians().sin(),
-            self.pitch.to_radians().sin(),
-            self.pitch.to_radians().cos() * (-self.yaw).to_radians().cos(),
+            pitch_rad.cos() * yaw_rad.sin(),
+            pitch_rad.sin(),
+            -pitch_rad.cos() * yaw_rad.cos(),
         )
         .normalize();
         let right = forward.cross(self.up).normalize();
         let up = right.cross(forward).normalize();
         Axes { forward, right, up }
     }
-    
-    pub fn move_direction(&mut self, direction: &cgmath::Vector3<f32>, axes: &Axes, delta_time: f32) {
-        if direction.x != 0.0 {
-            self.position += axes.right * direction.x * CAMERA_SPEED * delta_time;
-        }
-        if direction.y != 0.0 {
-            self.position += axes.up * direction.y * CAMERA_SPEED * delta_time;
-        }
-        if direction.z != 0.0 {
-            self.position += axes.forward * direction.z * CAMERA_SPEED * delta_time;
-        }
-    }
-    
-    pub fn rotate(&mut self, x_rot: f32, y_rot: f32, delta_time: f32) {
-        self.yaw += x_rot * CAMERA_ROTATION_SPEED * delta_time;
-        self.pitch += y_rot * CAMERA_ROTATION_SPEED * delta_time;
-        self.pitch = self.pitch.clamp(-89.9999, 89.9999);
-    }
+}
+
+#[derive(ShaderType)]
+struct GpuParticles<'a> {
+    pub length: ArrayLength,
+    #[size(runtime)]
+    pub particles: &'a [Particle],
+}
+
+#[derive(ShaderType)]
+struct GpuColors<'a> {
+    pub length: ArrayLength,
+    #[size(runtime)]
+    pub particles: &'a [cgmath::Vector3<f32>],
+}
+
+#[derive(ShaderType)]
+struct GpuCamera {
+    pub view_matrix: cgmath::Matrix4<f32>,
+    pub projection_matrix: cgmath::Matrix4<f32>,
 }
 
 struct App {
-    particles: Arc<Mutex<Particles>>,
+    particles: Particles,
     camera: Camera,
     last_time: std::time::Instant,
     fixed_time: std::time::Duration,
-    frame_stats: FrameStats,
-}
-
-struct FrameStats {
-    fps: f32,
-    frame_time_ms: f32,
-    update_time_ms: f64,
-}
-
-impl Default for FrameStats {
-    fn default() -> Self {
-        Self {
-            fps: 0.0,
-            frame_time_ms: 0.0,
-            update_time_ms: 0.0,
-        }
-    }
 }
 
 impl App {
-    fn new(_cc: &eframe::CreationContext) -> Self {
-        let particles = Self::create_particles();
-        let world_size = particles.lock().unwrap().world_size;
-        
-        let camera = Camera::new(cgmath::vec3(0.0, 0.0, -world_size * 1.5));
+    fn new(cc: &eframe::CreationContext) -> Self {
+        let render_state = cc.wgpu_render_state.as_ref().unwrap();
+        let renderer = Renderer::new(render_state);
+        render_state
+            .renderer
+            .write()
+            .paint_callback_resources
+            .insert(renderer);
 
-        Self {
-            particles,
-            camera,
-            last_time: std::time::Instant::now(),
-            fixed_time: std::time::Duration::ZERO,
-            frame_stats: FrameStats::default(),
-        }
-    }
-    
-    fn create_particles() -> Arc<Mutex<Particles>> {
+        let camera = Camera {
+            position: cgmath::vec3(1.0, 0.0, 15.0),
+            up: cgmath::vec3(0.0, 1.0, 0.0),
+            pitch: 0.0,
+            yaw: 0.0,
+        };
+
         let mut particles = Particles {
             world_size: 10.0,
             id_count: 5,
@@ -129,144 +109,453 @@ impl App {
             current_particles: vec![],
             previous_particles: vec![],
         };
-        
-        let world_size = particles.world_size;
-        
-        let particle_data: Vec<(cgmath::Vector3<f32>, usize)> = (0..1000)
-            .into_par_iter()
-            .map(|_| {
-                let mut local_rng = thread_rng();
-                let pos = cgmath::vec3(
-                    local_rng.gen_range(world_size * -0.5..=world_size * 0.5),
-                    local_rng.gen_range(world_size * -0.5..=world_size * 0.5),
-                    local_rng.gen_range(world_size * -0.5..=world_size * 0.5),
-                );
-                let id = local_rng.gen_range(0..5);
-                (pos, id)
-            })
-            .collect();
-            
-        particles.current_particles = particle_data
-            .into_iter()
-            .map(|(position, id)| Particle {
-                position,
+
+        particles.current_particles = (0..1000).into_par_iter().map(|_| {
+            let mut rng = thread_rng();
+            Particle {
+                position: cgmath::vec3(
+                    rng.gen_range(particles.world_size * -0.5..=particles.world_size * 0.5),
+                    rng.gen_range(particles.world_size * -0.5..=particles.world_size * 0.5),
+                    rng.gen_range(particles.world_size * -0.5..=particles.world_size * 0.5),
+                ),
                 velocity: cgmath::vec3(0.0, 0.0, 0.0),
-                id,
-            })
-            .collect();
-
-        Arc::new(Mutex::new(particles))
-    }
-    
-    fn handle_input(&mut self, ctx: &egui::Context, response: &egui::Response, delta_time: f32) {
-        if !response.has_focus() {
-            return;
-        }
-        
-        ctx.input(|i| {
-            let axes = self.camera.get_axes();
-            
-            let mut movement = cgmath::vec3(0.0, 0.0, 0.0);
-            if i.key_pressed(egui::Key::W) { movement.z += 1.0; }
-            if i.key_pressed(egui::Key::S) { movement.z -= 1.0; }
-            if i.key_pressed(egui::Key::A) { movement.x -= 1.0; }
-            if i.key_pressed(egui::Key::D) { movement.x += 1.0; }
-            if i.key_pressed(egui::Key::Q) { movement.y -= 1.0; }
-            if i.key_pressed(egui::Key::E) { movement.y += 1.0; }
-            
-            if movement.x != 0.0 || movement.y != 0.0 || movement.z != 0.0 {
-                self.camera.move_direction(&movement, &axes, delta_time);
+                id: rng.gen_range(0..5),
             }
-            
-            let mut x_rot = 0.0;
-            let mut y_rot = 0.0;
-            if i.key_pressed(egui::Key::ArrowLeft) { x_rot -= 1.0; }
-            if i.key_pressed(egui::Key::ArrowRight) { x_rot += 1.0; }
-            if i.key_pressed(egui::Key::ArrowUp) { y_rot += 1.0; }
-            if i.key_pressed(egui::Key::ArrowDown) { y_rot -= 1.0; }
-            
-            if x_rot != 0.0 || y_rot != 0.0 {
-                self.camera.rotate(x_rot, y_rot, delta_time);
-            }
-        });
-    }
-    
-    fn update_physics(&mut self) -> std::time::Duration {
-        let start_update = std::time::Instant::now();
-        
-        if self.fixed_time.as_secs_f32() >= TIME_STEP {
-            let particles_arc = Arc::clone(&self.particles);
-            
-            std::thread::spawn(move || {
-                let mut particles = particles_arc.lock().unwrap();
-                particles.update(TIME_STEP);
-            }).join().unwrap();
-            
-            self.fixed_time -= std::time::Duration::from_secs_f32(TIME_STEP);
+        }).collect();
+
+        Self {
+            particles,
+            camera,
+            last_time: std::time::Instant::now(),
+            fixed_time: std::time::Duration::ZERO,
         }
-        
-        start_update.elapsed()
-    }
-    
-    fn render_ui(&self, ctx: &egui::Context) -> egui::Response {
-        egui::SidePanel::left("Left Panel").show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.label(format!("FPS: {:.3}", self.frame_stats.fps));
-                ui.label(format!("Frame Time: {:.3}ms", self.frame_stats.frame_time_ms));
-                ui.label(format!("Update Time: {:.3}ms", self.frame_stats.update_time_ms));
-                ui.allocate_space(ui.available_size());
-            });
-        });
-
-        egui::CentralPanel::default()
-            .show(ctx, |ui| {
-                let (rect, response) =
-                    ui.allocate_exact_size(egui::Vec2::splat(300.0), egui::Sense::drag());
-                ui.painter().add(egui::PaintCallback {
-                    rect,
-                    callback: std::sync::Arc::new(
-                        eframe::egui_wgpu::CallbackFn::new()
-                            .prepare(
-                                move |_device, _queue, _encoder, _paint_callback_resources| {
-                                    Vec::new()
-                                },
-                            )
-                            .paint(move |_info, _render_pass, _paint_callback_resources| {}),
-                    ),
-                });
-
-                response
-            })
-            .inner
     }
 }
 
 impl eframe::App for App {
+    
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         let time = std::time::Instant::now();
-        let time_delta = time.duration_since(self.last_time);
-        let delta_time = time_delta.as_secs_f32();
+        let ts = time.duration_since(self.last_time);
         self.last_time = time;
-        
-        self.frame_stats.fps = 1.0 / delta_time;
-        self.frame_stats.frame_time_ms = delta_time * 1000.0;
-        
-        self.fixed_time += time_delta;
-        let update_elapsed = self.update_physics();
-        self.frame_stats.update_time_ms = update_elapsed.as_secs_f64() * 1000.0;
-        
-        let response = self.render_ui(ctx);
-        self.handle_input(ctx, &response, delta_time);
-        
+
+        self.fixed_time += ts;
+        let start_update = std::time::Instant::now();
+
+        if self.fixed_time.as_secs_f32() >= TIME_STEP {
+            let ts = TIME_STEP;
+
+            let particles: Arc<Mutex<Particles>> = Arc::new(Mutex::new(Particles {
+                current_particles: self.particles.current_particles.clone(),
+                colors: self.particles.colors.clone(),
+                world_size: self.particles.world_size.clone(), 
+                previous_particles: self.particles.previous_particles.clone(), 
+                id_count: self.particles.id_count.clone(), 
+                attraction_matrix: self.particles.attraction_matrix.clone(), 
+                friction_half_time: self.particles.friction_half_time.clone(), 
+                force_scale: self.particles.force_scale.clone(), 
+                particle_effect_radius: self.particles.particle_effect_radius.clone(),
+            }));
+            
+            let particles_clone = Arc::clone(&particles);
+            thread::spawn(move || {
+                let mut particles_lock = particles_clone.lock().unwrap();
+                particles_lock.update(ts);
+            });
+
+            let fixed_ts = ts;
+            if ctx.input(|i| i.key_down(egui::Key::W)) {
+                self.camera.position += self.camera.get_axes().forward * CAMERA_SPEED * fixed_ts;
+            }
+            if ctx.input(|i| i.key_down(egui::Key::S)) {
+                self.camera.position -= self.camera.get_axes().forward * CAMERA_SPEED * fixed_ts;
+            }
+            if ctx.input(|i| i.key_down(egui::Key::A)) {
+                self.camera.position -= self.camera.get_axes().right * CAMERA_SPEED * fixed_ts;
+            }
+            if ctx.input(|i| i.key_down(egui::Key::D)) {
+                self.camera.position += self.camera.get_axes().right * CAMERA_SPEED * fixed_ts;
+            }
+            if ctx.input(|i| i.key_down(egui::Key::Q)) {
+                self.camera.position -= self.camera.get_axes().up * CAMERA_SPEED * fixed_ts;
+            }
+            if ctx.input(|i| i.key_down(egui::Key::E)) {
+                self.camera.position += self.camera.get_axes().up * CAMERA_SPEED * fixed_ts;
+            }
+
+            if ctx.input(|i| i.key_down(egui::Key::ArrowUp)) {
+                self.camera.pitch += CAMERA_ROTATION_SPEED * fixed_ts;
+            }
+            if ctx.input(|i| i.key_down(egui::Key::ArrowDown)) {
+                self.camera.pitch -= CAMERA_ROTATION_SPEED * fixed_ts;
+            }
+            if ctx.input(|i| i.key_down(egui::Key::ArrowLeft)) {
+                self.camera.yaw -= CAMERA_ROTATION_SPEED * fixed_ts;
+            }
+            if ctx.input(|i| i.key_down(egui::Key::ArrowRight)) {
+                self.camera.yaw += CAMERA_ROTATION_SPEED * fixed_ts;
+            }
+
+            self.camera.pitch = self.camera.pitch.clamp(-89.9999, 89.9999);
+
+            self.fixed_time -= std::time::Duration::from_secs_f32(TIME_STEP);
+        }
+
+        let update_elapsed = start_update.elapsed();
+
+        let ts = ts.as_secs_f32();
+
+        egui::SidePanel::left("Left Panel").show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.label(format!("FPS: {:.3}", 1.0 / ts));
+                ui.label(format!("Frame Time: {:.3}ms", ts * 1000.0));
+                ui.label(format!(
+                    "Update Time: {:.3}ms",
+                    update_elapsed.as_secs_f64() * 1000.0
+                ));
+                ui.allocate_space(ui.available_size());
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let (rect, _response) =
+                ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
+
+            let camera_uniform = {
+                let camera = &self.camera;
+                let mut camera_uniform = UniformBuffer::new([0; <GpuCamera as ShaderSize>::SHADER_SIZE.get() as _]);
+                camera_uniform
+                    .write(&{
+                        let axes = camera.get_axes();
+                        GpuCamera {
+                            view_matrix: cgmath::Matrix4::look_to_rh(
+                                cgmath::point3(
+                                    camera.position.x,
+                                    camera.position.y,
+                                    camera.position.z,
+                                ),
+                                axes.forward,
+                                axes.up,
+                            ),
+                            projection_matrix: cgmath::perspective(
+                                cgmath::Rad::from(cgmath::Deg(60.0)),
+                                rect.width() / rect.height(),
+                                0.001,
+                                1000.0,
+                            ),
+                        }
+                    })
+                    .unwrap();
+                camera_uniform.into_inner()
+            };
+
+            let particles_storage = {
+                let particles = &self.particles;
+                let mut particles_storage = StorageBuffer::new(vec![]);
+                particles_storage
+                    .write(&GpuParticles {
+                        length: ArrayLength,
+                        particles: &particles.current_particles,
+                    })
+                    .unwrap();
+                particles_storage.into_inner()
+            };
+
+            let colors_storage = {
+                let particles = &self.particles;
+                let mut colors_storage = StorageBuffer::new(vec![]);
+                colors_storage
+                    .write(&GpuColors {
+                        length: ArrayLength,
+                        particles: &particles.colors,
+                    })
+                    .unwrap();
+                colors_storage.into_inner()
+            };
+
+            let sphere_count = self.particles.current_particles.len();
+
+            ui.painter().add(egui::PaintCallback {
+                rect,
+                callback: std::sync::Arc::new(
+                    eframe::egui_wgpu::CallbackFn::new()
+                        .prepare(move |device, queue, encoder, paint_callback_resources| {
+                            let renderer: &mut Renderer =
+                                paint_callback_resources.get_mut().unwrap();
+                            renderer
+                                .prepare(&camera_uniform, &particles_storage, &colors_storage, rect, device, queue, encoder)
+                        })
+                        .paint(move |_info, render_pass, paint_callback_resources| {
+                            let renderer: &Renderer = paint_callback_resources.get().unwrap();
+                            renderer.paint(sphere_count as _, render_pass);
+                        }),
+                ),
+            });
+        });
+
         ctx.request_repaint();
+    }
+}
+
+
+
+
+
+
+
+struct Renderer {
+    camera_uniform_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    particles_storage_buffer: wgpu::Buffer,
+    particles_storage_buffer_size: usize,
+    colors_storage_buffer: wgpu::Buffer,
+    colors_storage_buffer_size: usize,
+    particles_bind_group_layout: wgpu::BindGroupLayout,
+    particles_bind_group: wgpu::BindGroup,
+    sphere_render_pipeline: wgpu::RenderPipeline,
+}
+
+impl Renderer {
+    fn new(render_state: &eframe::egui_wgpu::RenderState) -> Self {
+        let device = &render_state.device;
+        
+        let particles_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Particles Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("./particles.wgsl").into()),
+        });
+    
+        let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Camera Bind Group Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: Some(<GpuCamera as ShaderSize>::SHADER_SIZE),
+                },
+                count: None,
+            }],
+        });
+
+        let camera_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Camera Uniform Buffer"),
+            contents: &[0; <GpuCamera as ShaderSize>::SHADER_SIZE.get() as _],
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::UNIFORM,
+        });
+
+                // let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                //     label: Some("Camera Bind Group"),
+                //     layout: &camera_bind_group_layout,
+                //     entries: &[wgpu::BindGroupEntry {
+                //         binding: 0,
+                //         resource: camera_uniform_buffer.as_entire_binding(),
+                //     }],
+                // });
+
+                let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Camera Bind Group"),
+                    layout: &camera_bind_group_layout,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: camera_uniform_buffer.as_entire_binding(),
+                    }],
+                });
+
+        let particles_bind_group_layout =
+            render_state
+                .device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Particles Bind Group Layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: Some(<GpuParticles as ShaderType>::min_size()),
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: Some(<GpuColors as ShaderType>::min_size()),
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+        const PARTICLES_STORAGE_BUFFER_SIZE: usize =
+            <GpuParticles as ShaderType>::METADATA.min_size().get() as _;
+        let particles_storage_buffer =
+            render_state
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Particles Storage Buffer"),
+                    contents: &[0; PARTICLES_STORAGE_BUFFER_SIZE],
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+                });
+
+        const COLORS_STORAGE_BUFFER_SIZE: usize =
+            <GpuColors as ShaderType>::METADATA.min_size().get() as _;
+        let colors_storage_buffer =
+            render_state
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Particles Storage Buffer"),
+                    contents: &[0; COLORS_STORAGE_BUFFER_SIZE],
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+                });
+
+        let particles_bind_group =
+            render_state
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("Particles Bind Group"),
+                    layout: &particles_bind_group_layout,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: particles_storage_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: colors_storage_buffer.as_entire_binding(),
+                        },
+                    ],
+                });
+
+        let particles_pipeline_layout =
+            render_state
+                .device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Particles Pipeline Layout"),
+                    bind_group_layouts: &[&camera_bind_group_layout, &particles_bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+
+        let sphere_render_pipeline =
+            render_state
+                .device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("Particles Render Pipeline"),
+                    layout: Some(&particles_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &particles_shader,
+                        entry_point: "vs_main",
+                        buffers: &[],
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &particles_shader,
+                        entry_point: "fs_main",
+                        targets: &[Some(render_state.target_format.into())],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        topology: wgpu::PrimitiveTopology::TriangleStrip,
+                        ..Default::default()
+                    },
+                    depth_stencil: None, // TODO: depth buffer
+                    multisample: wgpu::MultisampleState {
+                        ..Default::default()
+                    },
+                    multiview: None,
+                });
+
+        Self {
+            camera_uniform_buffer,
+            camera_bind_group,
+            particles_storage_buffer,
+            particles_storage_buffer_size: PARTICLES_STORAGE_BUFFER_SIZE,
+            colors_storage_buffer,
+            colors_storage_buffer_size: COLORS_STORAGE_BUFFER_SIZE,
+            particles_bind_group_layout,
+            particles_bind_group,
+            sphere_render_pipeline,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare(
+        &mut self,
+        camera: &[u8],
+        particles: &[u8],
+        colors: &[u8],
+        _rect: egui::Rect,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _encoder: &wgpu::CommandEncoder,
+    ) -> Vec<wgpu::CommandBuffer> {
+        queue.write_buffer(&self.camera_uniform_buffer, 0, camera);
+
+        let mut particles_bind_group_invalidated = false;
+        if self.particles_storage_buffer_size >= particles.len() {
+            queue.write_buffer(&self.particles_storage_buffer, 0, particles);
+        } else {
+            particles_bind_group_invalidated = true;
+            self.particles_storage_buffer =
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Particles Storage Buffer"),
+                    contents: particles,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+                });
+            self.particles_storage_buffer_size = particles.len();
+        }
+        if self.colors_storage_buffer_size >= particles.len() {
+            queue.write_buffer(&self.colors_storage_buffer, 0, colors);
+        } else {
+            particles_bind_group_invalidated = true;
+            self.colors_storage_buffer =
+                device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Particles Storage Buffer"),
+                    contents: colors,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+                });
+            self.colors_storage_buffer_size = colors.len();
+        }
+        if particles_bind_group_invalidated {
+            self.particles_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Particles Bind Group"),
+                layout: &self.particles_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.particles_storage_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.colors_storage_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+        }
+
+        vec![]
+    }
+
+    fn paint<'a>(&'a self, sphere_count: u32, render_pass: &mut wgpu::RenderPass<'a>) {
+        render_pass.set_pipeline(&self.sphere_render_pipeline);
+        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        render_pass.set_bind_group(1, &self.particles_bind_group, &[]);
+        render_pass.draw(0..4, 0..sphere_count);
     }
 }
 
 fn main() {
     eframe::run_native(
-        "Particle Physics 3D",
+        "3D Particle Simulation",
         eframe::NativeOptions {
             renderer: eframe::Renderer::Wgpu,
+            wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+                present_mode: wgpu::PresentMode::AutoNoVsync,
+                ..Default::default()
+            },
             vsync: false,
             ..Default::default()
         },
