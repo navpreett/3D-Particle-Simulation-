@@ -29,7 +29,6 @@ pub struct Particles {
     pub particle_effect_radius: f32,
 }
 
-
 impl Particles {
     fn compute_cell_coord(&self, v: cgmath::Vector3<f32>) -> cgmath::Vector3<isize> {
         cgmath::vec3(
@@ -47,7 +46,7 @@ impl Particles {
         hasher.finish() as usize
     }
 
-    fn compute_particle_force(
+    fn particle_force(
         &self,
         particle: &Particle,
         other_particle: &Particle,
@@ -71,38 +70,11 @@ impl Particles {
         relative_position / distance * f
     }
 
-    fn update_particle_kinematics(&self, particle: &mut Particle, total_force: cgmath::Vector3<f32>, ts: f32) {
-        particle.velocity += total_force * self.force_scale * self.particle_effect_radius * ts;
-        let velocity_change = particle.velocity * self.friction * ts;
-        
-        if velocity_change.magnitude2() > particle.velocity.magnitude2() {
-            particle.velocity = cgmath::vec3(0.0, 0.0, 0.0);
-        } else {
-            particle.velocity -= velocity_change;
-        }
-
-        particle.position += particle.velocity * ts;
-        particle.position.x = self.wrap_coordinate(particle.position.x);
-        particle.position.y = self.wrap_coordinate(particle.position.y);
-        particle.position.z = self.wrap_coordinate(particle.position.z);
-    }
-
-    fn wrap_coordinate(&self, coord: f32) -> f32 {
-        let half_world_size = self.world_size * 0.5;
-        if coord > half_world_size {
-            coord - self.world_size
-        } else if coord < -half_world_size {
-            coord + self.world_size
-        } else {
-            coord
-        }
-    }
-
     pub fn update(&mut self, ts: f32) {
         assert!(self.world_size >= 2.0 * self.particle_effect_radius);
 
         let hash_table_length = self.current_particles.len();
-        let hash_table: Vec<AtomicUsize> = std::iter::repeat_with(|| AtomicUsize::new(0))
+        let hash_table: Vec<_> = std::iter::repeat_with(|| AtomicUsize::new(0))
             .take(hash_table_length + 1)
             .collect();
 
@@ -115,7 +87,7 @@ impl Particles {
             hash_table[i].fetch_add(hash_table[i - 1].load(Relaxed), Relaxed);
         }
 
-        let particle_indices: Vec<AtomicUsize> = std::iter::repeat_with(|| AtomicUsize::new(0))
+        let particle_indices: Vec<_> = std::iter::repeat_with(|| AtomicUsize::new(0))
             .take(self.current_particles.len())
             .collect();
 
@@ -133,8 +105,8 @@ impl Particles {
         
         self.current_particles = self.previous_particles
             .par_iter()
-            .map(|particle| {
-                let mut updated_particle = *particle;
+            .map(|&particle| {
+                let mut updated_particle = particle;
                 let mut total_force = cgmath::Vector3::zero();
 
                 for x_offset in -1..=1 {
@@ -142,66 +114,75 @@ impl Particles {
                         for z_offset in -1..=1 {
                             let offset = cgmath::vec3(x_offset as _, y_offset as _, z_offset as _)
                                 * self.world_size;
-                            
-                            let nearby_particles = self.find_nearby_particles(
-                                particle, 
-                                offset, 
-                                &particle_indices, 
-                                &hash_table, 
-                                hash_table_length
-                            );
+                            let cell = self.compute_cell_coord(particle.position + offset);
 
-                            total_force += nearby_particles
-                                .iter()
-                                .map(|&other_index| {
-                                    let other_particle = &self.previous_particles[other_index];
-                                    let relative_pos = other_particle.position - (particle.position + offset);
-                                    let sqr_distance = relative_pos.magnitude2();
-                                    
-                                    if sqr_distance > 0.0 && 
-                                       sqr_distance < self.particle_effect_radius * self.particle_effect_radius {
-                                        let distance = sqr_distance.sqrt();
-                                        self.compute_particle_force(particle, other_particle, distance)
-                                    } else {
-                                        cgmath::Vector3::zero()
+                            for x_cell_offset in -1isize..=1 {
+                                for y_cell_offset in -1isize..=1 {
+                                    for z_cell_offset in -1isize..=1 {
+                                        let target_cell = cell + cgmath::vec3(
+                                            x_cell_offset, 
+                                            y_cell_offset, 
+                                            z_cell_offset
+                                        );
+
+                                        let index = Self::hash_cell(target_cell) % hash_table_length;
+                                        for idx in hash_table[index].load(Relaxed)..hash_table[index + 1].load(Relaxed) {
+                                            let other_index = particle_indices[idx].load(Relaxed);
+                                            let other_particle = &self.previous_particles[other_index];
+
+                                            let relative_position = other_particle.position 
+                                                - (particle.position + offset);
+                                            let sqr_distance = relative_position.magnitude2();
+                                            
+                                            if sqr_distance > 0.0 && 
+                                               sqr_distance < self.particle_effect_radius * self.particle_effect_radius {
+                                                let distance = sqr_distance.sqrt();
+                                                total_force += self.particle_force(&particle, other_particle, distance);
+                                            }
+                                        }
                                     }
-                                })
-                                .sum();
+                                }
+                            }
                         }
                     }
                 }
 
-                self.update_particle_kinematics(&mut updated_particle, total_force, ts);
+                // Velocity and position update
+                updated_particle.velocity += 
+                    total_force * self.force_scale * self.particle_effect_radius * ts;
+                
+                let velocity_change = updated_particle.velocity * self.friction * ts;
+                if velocity_change.magnitude2() > updated_particle.velocity.magnitude2() {
+                    updated_particle.velocity = cgmath::vec3(0.0, 0.0, 0.0);
+                } else {
+                    updated_particle.velocity -= velocity_change;
+                }
+
+                updated_particle.position += updated_particle.velocity * ts;
+
+                // World wrapping
+                let half_world_size = self.world_size * 0.5;
+                if updated_particle.position.x > half_world_size {
+                    updated_particle.position.x -= self.world_size;
+                }
+                if updated_particle.position.x < -half_world_size {
+                    updated_particle.position.x += self.world_size;
+                }
+                if updated_particle.position.y > half_world_size {
+                    updated_particle.position.y -= self.world_size;
+                }
+                if updated_particle.position.y < -half_world_size {
+                    updated_particle.position.y += self.world_size;
+                }
+                if updated_particle.position.z > half_world_size {
+                    updated_particle.position.z -= self.world_size;
+                }
+                if updated_particle.position.z < -half_world_size {
+                    updated_particle.position.z += self.world_size;
+                }
+
                 updated_particle
             })
             .collect();
-    }
-
-    fn find_nearby_particles(
-        &self,
-        particle: &Particle,
-        offset: cgmath::Vector3<f32>,
-        particle_indices: &[AtomicUsize],
-        hash_table: &[AtomicUsize],
-        hash_table_length: usize,
-    ) -> Vec<usize> {
-        let mut nearby_particles = Vec::new();
-        let cell = self.compute_cell_coord(particle.position + offset);
-
-        for x_cell_offset in -1isize..=1 {
-            for y_cell_offset in -1isize..=1 {
-                for z_cell_offset in -1isize..=1 {
-                    let target_cell = cell + cgmath::vec3(x_cell_offset, y_cell_offset, z_cell_offset);
-                    let index = Self::hash_cell(target_cell) % hash_table_length;
-                    
-                    nearby_particles.extend(
-                        (hash_table[index].load(Relaxed)..hash_table[index + 1].load(Relaxed))
-                        .map(|idx| particle_indices[idx].load(Relaxed))
-                    );
-                }
-            }
-        }
-
-        nearby_particles
     }
 }
