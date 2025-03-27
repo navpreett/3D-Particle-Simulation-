@@ -2242,7 +2242,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "particle_life_3d"
+name = "particle_3d"
 version = "0.1.0"
 dependencies = [
  "cgmath",

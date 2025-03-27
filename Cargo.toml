@@ -1,11 +1,12 @@
 [package]
-name = "projectt"
+name = "particle_3d"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rayon = "1.7.0"
-macroquad = "0.3.25"
-enum-map = "2.5.0"
+cgmath = "0.18.0"
 rand = "0.8.5"
-particle_life_3d = "0.1.0" 
+rayon = "1.7.0"
+eframe = { version = "0.21.3", features = ["wgpu"] }
+encase = { version = "0.5.0", features = ["cgmath"] }
+parking_lot = "0.12"
