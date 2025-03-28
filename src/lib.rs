@@ -1,17 +1,14 @@
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
-    sync::{
-        atomic::{AtomicUsize, Ordering::Relaxed},
-        // Arc,
-    },
+    sync::atomic::{AtomicUsize, Ordering::Relaxed},
 };
 
 use cgmath::prelude::*;
 use encase::ShaderType;
 use rayon::prelude::*;
 
-#[derive(Clone, Copy, ShaderType)]
+#[derive(Clone, Copy, ShaderType, Debug)]
 pub struct Particle {
     pub position: cgmath::Vector3<f32>,
     pub velocity: cgmath::Vector3<f32>,
@@ -54,42 +51,66 @@ impl Particles {
         if distance < self.min_attraction_percentage {
             distance / self.min_attraction_percentage - 1.0
         } else if self.min_attraction_percentage < distance && distance < 1.0 {
-            attraction * (1.0 - (2.0 * distance - 1.0 - self.min_attraction_percentage).abs() 
-                / (1.0 - self.min_attraction_percentage))
+            attraction * (1.0 - (2.0 * distance - 1.0 - self.min_attraction_percentage)
+                .abs() / (1.0 - self.min_attraction_percentage))
         } else {
             0.0
         }
     }
 
-    fn apply_boundary_conditions(&self, particle: &mut Particle) {
-        let half_world_size = self.world_size * 0.5;
+    fn handle_wall_collision(&self, particle: &mut Particle) {
+        let half_world = self.world_size * 0.5;
         
-        macro_rules! handle_boundary {
-            ($coord:expr, $vel:expr) => {
-                if $coord > half_world_size {
-                    if self.solid_walls {
-                        $coord = half_world_size;
-                        $vel = $vel.min(0.0);
-                    } else {
-                        $coord -= self.world_size;
-                    }
-                } else if $coord < -half_world_size {
-                    if self.solid_walls {
-                        $coord = -half_world_size;
-                        $vel = $vel.max(0.0);
-                    } else {
-                        $coord += self.world_size;
-                    }
-                }
-            };
+        if particle.position.x > half_world {
+            if self.solid_walls {
+                particle.position.x = half_world;
+                particle.velocity.x = particle.velocity.x.min(0.0);
+            } else {
+                particle.position.x -= self.world_size;
+            }
+        } else if particle.position.x < -half_world {
+            if self.solid_walls {
+                particle.position.x = -half_world;
+                particle.velocity.x = particle.velocity.x.max(0.0);
+            } else {
+                particle.position.x += self.world_size;
+            }
         }
 
-        handle_boundary!(particle.position.x, particle.velocity.x);
-        handle_boundary!(particle.position.y, particle.velocity.y);
-        handle_boundary!(particle.position.z, particle.velocity.z);
+        if particle.position.y > half_world {
+            if self.solid_walls {
+                particle.position.y = half_world;
+                particle.velocity.y = particle.velocity.y.min(0.0);
+            } else {
+                particle.position.y -= self.world_size;
+            }
+        } else if particle.position.y < -half_world {
+            if self.solid_walls {
+                particle.position.y = -half_world;
+                particle.velocity.y = particle.velocity.y.max(0.0);
+            } else {
+                particle.position.y += self.world_size;
+            }
+        }
+
+        if particle.position.z > half_world {
+            if self.solid_walls {
+                particle.position.z = half_world;
+                particle.velocity.z = particle.velocity.z.min(0.0);
+            } else {
+                particle.position.z -= self.world_size;
+            }
+        } else if particle.position.z < -half_world {
+            if self.solid_walls {
+                particle.position.z = -half_world;
+                particle.velocity.z = particle.velocity.z.max(0.0);
+            } else {
+                particle.position.z += self.world_size;
+            }
+        }
     }
 
-    pub fn update(&mut self, ts: f32) {
+    pub fn update(&mut self, ts: f32) -> Vec<Particle> {
         assert!(self.world_size >= 2.0 * self.particle_effect_radius);
 
         let hash_table_length = self.current_particles.len();
@@ -121,73 +142,91 @@ impl Particles {
 
         std::mem::swap(&mut self.current_particles, &mut self.previous_particles);
         self.current_particles.clear();
-
+        
         self.current_particles = self.previous_particles
             .par_iter()
-            .map(|particle| self.update_single_particle(*particle, &hash_table, &particle_indices, ts))
-            .collect();
-    }
+            .map(|&particle| {
+                let mut updated_particle = particle;
+                
+                let total_force = (-1..=1)
+                    .into_par_iter()
+                    .flat_map(|x_offset| {
+                        (-1..=1).into_par_iter().flat_map(move |y_offset| {
+                            (-1..=1).into_par_iter().map(move |z_offset| {
+                                (x_offset, y_offset, z_offset)
+                            })
+                        })
+                    })
+                    .fold(
+                        || cgmath::Vector3::zero(), 
+                        |mut acc, (x_offset, y_offset, z_offset)| {
+                            let offset = cgmath::vec3(x_offset as _, y_offset as _, z_offset as _)
+                                * self.world_size;
+                            let cell = self.cell_coord(updated_particle.position + offset);
 
-    fn update_single_particle(
-        &self, 
-        mut particle: Particle, 
-        hash_table: &[AtomicUsize],
-        particle_indices: &[AtomicUsize],
-        ts: f32,
-    ) -> Particle {
-        let hash_table_length = self.previous_particles.len();
-        let mut total_force = cgmath::Vector3::zero();
+                            for x_cell_offset in -1..=1 {
+                                for y_cell_offset in -1..=1 {
+                                    for z_cell_offset in -1..=1 {
+                                        let cell = cell
+                                            + cgmath::vec3(x_cell_offset, y_cell_offset, z_cell_offset);
 
-        for x_offset in -1..=1 {
-            for y_offset in -1..=1 {
-                for z_offset in -1..=1 {
-                    let offset = cgmath::vec3(x_offset as _, y_offset as _, z_offset as _) * self.world_size;
-                    let cell = self.cell_coord(particle.position + offset);
+                                        let index = Self::hash_cell(cell) % hash_table_length;
+                                        for index in &particle_indices[hash_table[index]
+                                            .load(Relaxed)
+                                            ..hash_table[index + 1].load(Relaxed)]
+                                        {
+                                            let other_particle =
+                                                &self.previous_particles[index.load(Relaxed)];
 
-                    for x_cell_offset in -1isize..=1 {
-                        for y_cell_offset in -1isize..=1 {
-                            for z_cell_offset in -1isize..=1 {
-                                let cell = cell + cgmath::vec3(x_cell_offset, y_cell_offset, z_cell_offset);
-                                let index = Self::hash_cell(cell) % hash_table_length;
-
-                                for index in &particle_indices[hash_table[index].load(Relaxed)
-                                    ..hash_table[index + 1].load(Relaxed)]
-                                {
-                                    let other_particle = &self.previous_particles[index.load(Relaxed)];
-                                    let relative_position = other_particle.position - (particle.position + offset);
-                                    let sqr_distance = relative_position.magnitude2();
-
-                                    if sqr_distance > 0.0 
-                                        && sqr_distance < self.particle_effect_radius * self.particle_effect_radius 
-                                    {
-                                        let distance = sqr_distance.sqrt();
-                                        let attraction = self.attraction_matrix[(particle.id * self.id_count + other_particle.id) as usize];
-                                        let f = self.calculate_force(distance, attraction);
-                                        total_force += relative_position / distance * f;
+                                            let relative_position = other_particle.position
+                                                - (updated_particle.position + offset);
+                                            let sqr_distance = relative_position.magnitude2();
+                                            
+                                            if sqr_distance > 0.0
+                                                && sqr_distance
+                                                    < self.particle_effect_radius
+                                                        * self.particle_effect_radius
+                                            {
+                                                let distance = sqr_distance.sqrt();
+                                                let f = self.calculate_force(
+                                                    distance,
+                                                    self.attraction_matrix[(updated_particle.id
+                                                        * self.id_count
+                                                        + other_particle.id)
+                                                        as usize],
+                                                );
+                                                acc += relative_position / distance * f;
+                                            }
+                                        }
                                     }
                                 }
                             }
+                            acc
                         }
-                    }
+                    )
+                    .reduce(
+                        || cgmath::Vector3::zero(), 
+                        |a, b| a + b
+                    );
+
+                updated_particle.velocity +=
+                    total_force * self.force_scale * self.particle_effect_radius * ts;
+                updated_particle.velocity += self.gravity * ts;
+
+                let velocity_change = updated_particle.velocity * self.friction * ts;
+                if velocity_change.magnitude2() > updated_particle.velocity.magnitude2() {
+                    updated_particle.velocity = cgmath::vec3(0.0, 0.0, 0.0);
+                } else {
+                    updated_particle.velocity -= velocity_change;
                 }
-            }
-        }
 
-        particle.velocity += total_force * self.force_scale * self.particle_effect_radius * ts;
-        particle.velocity += self.gravity * ts;
+                updated_particle.position += updated_particle.velocity * ts;
+                self.handle_wall_collision(&mut updated_particle);
 
-        let velocity_change = particle.velocity * self.friction * ts;
-        if velocity_change.magnitude2() > particle.velocity.magnitude2() {
-            particle.velocity = cgmath::vec3(0.0, 0.0, 0.0);
-        } else {
-            particle.velocity -= velocity_change;
-        }
+                updated_particle
+            })
+            .collect();
 
-        particle.position += particle.velocity * ts;
-        
-        let mut updated_particle = particle;
-        self.apply_boundary_conditions(&mut updated_particle);
-
-        updated_particle
+        self.current_particles.clone()
     }
 }

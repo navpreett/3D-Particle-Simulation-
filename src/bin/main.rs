@@ -1,5 +1,4 @@
 use std::cmp::Ordering;
-// use std::sync::Arc;
 
 use cgmath::prelude::*;
 use eframe::egui_wgpu::wgpu;
@@ -12,69 +11,41 @@ use rayon::prelude::*;
 
 const CAMERA_SPEED: f32 = 5.0;
 const CAMERA_ROTATION_SPEED: f32 = 90.0;
+const MAX_PARTICLE_TYPES: usize = 5;
 
-#[derive(Clone, Debug)]
-struct CameraAxes {
-    forward: cgmath::Vector3<f32>,
-    right: cgmath::Vector3<f32>,
-    up: cgmath::Vector3<f32>,
-}
-
-#[derive(Clone, Debug)]
-struct Camera {
+#[derive(Clone)]
+struct CameraSystem {
     position: cgmath::Vector3<f32>,
     up: cgmath::Vector3<f32>,
     pitch: f32,
     yaw: f32,
 }
 
-impl Camera {
-    fn compute_axes(&self) -> CameraAxes {
+impl CameraSystem {
+    fn calculate_axes(&self) -> (cgmath::Vector3<f32>, cgmath::Vector3<f32>, cgmath::Vector3<f32>) {
         let forward = cgmath::vec3(
             self.pitch.to_radians().cos() * self.yaw.to_radians().sin(),
             self.pitch.to_radians().sin(),
             -self.pitch.to_radians().cos() * self.yaw.to_radians().cos(),
         )
         .normalize();
-        
         let right = forward.cross(self.up).normalize();
         let up = right.cross(forward).normalize();
-        
-        CameraAxes { forward, right, up }
+        (forward, right, up)
+    }
+
+    fn move_camera(&mut self, delta: f32, input_vector: cgmath::Vector3<f32>) {
+        self.position += input_vector * CAMERA_SPEED * delta;
+    }
+
+    fn rotate_camera(&mut self, pitch_delta: f32, yaw_delta: f32) {
+        self.pitch += pitch_delta;
+        self.yaw += yaw_delta;
+        self.pitch = self.pitch.clamp(-89.9999, 89.9999);
     }
 }
 
-#[derive(ShaderType)]
-struct GpuParticles<'a> {
-    world_size: f32,
-    length: ArrayLength,
-    #[size(runtime)]
-    particles: &'a [Particle],
-}
-
-#[derive(ShaderType)]
-struct GpuColors<'a> {
-    length: ArrayLength,
-    #[size(runtime)]
-    particles: &'a [cgmath::Vector3<f32>],
-}
-
-#[derive(ShaderType)]
-struct GpuCamera {
-    view_matrix: cgmath::Matrix4<f32>,
-    projection_matrix: cgmath::Matrix4<f32>,
-}
-
-struct App {
-    particles: Particles,
-    camera: Camera,
-    last_time: std::time::Instant,
-    fixed_time: std::time::Duration,
-    ticks_per_second: f32,
-    color_window_open: bool,
-}
-
-fn generate_random_particles(world_size: f32, count: usize) -> Vec<Particle> {
+fn generate_particles(world_size: f32, count: usize) -> Vec<Particle> {
     (0..count)
         .into_par_iter()
         .map(|_| {
@@ -86,17 +57,47 @@ fn generate_random_particles(world_size: f32, count: usize) -> Vec<Particle> {
                     rng.gen_range(world_size * -0.5..=world_size * 0.5),
                 ),
                 velocity: cgmath::vec3(0.0, 0.0, 0.0),
-                id: rng.gen_range(0..5),
+                id: rng.gen_range(0..MAX_PARTICLE_TYPES) as u32,
             }
         })
         .collect()
 }
 
-impl App {
+#[derive(ShaderType)]
+struct GpuParticles<'a> {
+    pub world_size: f32,
+    pub length: ArrayLength,
+    #[size(runtime)]
+    pub particles: &'a [Particle],
+}
+
+#[derive(ShaderType)]
+struct GpuColors<'a> {
+    pub length: ArrayLength,
+    #[size(runtime)]
+    pub particles: &'a [cgmath::Vector3<f32>],
+}
+
+#[derive(ShaderType)]
+struct GpuCamera {
+    pub view_matrix: cgmath::Matrix4<f32>,
+    pub projection_matrix: cgmath::Matrix4<f32>,
+}
+
+struct SimulationApp {
+    particles: Particles,
+    camera: CameraSystem,
+    last_time: std::time::Instant,
+    fixed_time: std::time::Duration,
+    ticks_per_second: f32,
+    color_window_open: bool,
+}
+
+impl SimulationApp {
     fn new(cc: &eframe::CreationContext) -> Self {
-        let mut particles = Particles {
+        let particles = Particles {
             world_size: 10.0,
-            id_count: 5,
+            id_count: MAX_PARTICLE_TYPES as u32,
             colors: vec![
                 cgmath::vec3(1.0, 0.0, 0.0),
                 cgmath::vec3(0.0, 1.0, 0.0),
@@ -115,13 +116,13 @@ impl App {
             friction: 0.97,
             force_scale: 1.0,
             min_attraction_percentage: 0.3,
-            current_particles: vec![],
+            current_particles: generate_particles(10.0, 1000),
             previous_particles: vec![],
+            solid_walls: false,
+            gravity: cgmath::vec3(0.0, 0.0, 0.0),
         };
 
-        particles.current_particles = generate_random_particles(particles.world_size, 1000);
-
-        let camera = Camera {
+        let camera = CameraSystem {
             position: cgmath::vec3(1.0, 0.0, particles.world_size * 1.6),
             up: cgmath::vec3(0.0, 1.0, 0.0),
             pitch: 0.0,
@@ -147,51 +148,9 @@ impl App {
 
         app
     }
-
-    fn handle_camera_movement(&mut self, ctx: &eframe::egui::Context, ts: f32) {
-        if !ctx.wants_keyboard_input() {
-            ctx.input(|i| {
-                let axes = self.camera.compute_axes();
-
-                let movement_map = [
-                    (egui::Key::W, axes.forward),
-                    (egui::Key::S, -axes.forward),
-                    (egui::Key::A, -axes.right),
-                    (egui::Key::D, axes.right),
-                    (egui::Key::Q, -axes.up),
-                    (egui::Key::E, axes.up),
-                ];
-
-                movement_map.iter().for_each(|&(key, direction)| {
-                    if i.key_down(key) {
-                        self.camera.position += direction * CAMERA_SPEED * ts;
-                    }
-                });
-
-                let rotation_map = [
-                    (egui::Key::ArrowUp, "pitch", CAMERA_ROTATION_SPEED),
-                    (egui::Key::ArrowDown, "pitch", -CAMERA_ROTATION_SPEED),
-                    (egui::Key::ArrowLeft, "yaw", -CAMERA_ROTATION_SPEED),
-                    (egui::Key::ArrowRight, "yaw", CAMERA_ROTATION_SPEED),
-                ];
-
-                rotation_map.iter().for_each(|&(key, axis, value)| {
-                    if i.key_down(key) {
-                        match axis {
-                            "pitch" => self.camera.pitch += value * ts,
-                            "yaw" => self.camera.yaw += value * ts,
-                            _ => {}
-                        }
-                    }
-                });
-
-                self.camera.pitch = self.camera.pitch.clamp(-89.9999, 89.9999);
-            });
-        }
-    }
 }
 
-impl eframe::App for App {
+impl eframe::App for SimulationApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         let time = std::time::Instant::now();
         let ts = time.duration_since(self.last_time);
@@ -208,8 +167,43 @@ impl eframe::App for App {
 
         let ts = ts.as_secs_f32();
 
-        // Handle camera movement
-        self.handle_camera_movement(ctx, ts);
+        if !ctx.wants_keyboard_input() {
+            ctx.input(|i| {
+                let (forward, right, up) = self.camera.calculate_axes();
+
+                if i.key_down(egui::Key::W) {
+                    self.camera.move_camera(ts, forward);
+                }
+                if i.key_down(egui::Key::S) {
+                    self.camera.move_camera(ts, -forward);
+                }
+                if i.key_down(egui::Key::A) {
+                    self.camera.move_camera(ts, -right);
+                }
+                if i.key_down(egui::Key::D) {
+                    self.camera.move_camera(ts, right);
+                }
+                if i.key_down(egui::Key::Q) {
+                    self.camera.move_camera(ts, -up);
+                }
+                if i.key_down(egui::Key::E) {
+                    self.camera.move_camera(ts, up);
+                }
+
+                if i.key_down(egui::Key::ArrowUp) {
+                    self.camera.rotate_camera(CAMERA_ROTATION_SPEED * ts, 0.0);
+                }
+                if i.key_down(egui::Key::ArrowDown) {
+                    self.camera.rotate_camera(-CAMERA_ROTATION_SPEED * ts, 0.0);
+                }
+                if i.key_down(egui::Key::ArrowLeft) {
+                    self.camera.rotate_camera(0.0, -CAMERA_ROTATION_SPEED * ts);
+                }
+                if i.key_down(egui::Key::ArrowRight) {
+                    self.camera.rotate_camera(0.0, CAMERA_ROTATION_SPEED * ts);
+                }
+            });
+        }
 
         egui::SidePanel::left("Left Panel").show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -233,16 +227,7 @@ impl eframe::App for App {
                             Ordering::Greater => {
                                 self.particles.current_particles.extend(
                                     std::iter::repeat_with(|| {
-                                        let mut rng = thread_rng();
-                                        Particle {
-                                            position: cgmath::vec3(
-                                                rng.gen_range(self.particles.world_size * -0.5..=self.particles.world_size * 0.5),
-                                                rng.gen_range(self.particles.world_size * -0.5..=self.particles.world_size * 0.5),
-                                                rng.gen_range(self.particles.world_size * -0.5..=self.particles.world_size * 0.5),
-                                            ),
-                                            velocity: cgmath::vec3(0.0, 0.0, 0.0),
-                                            id: rng.gen_range(0..5),
-                                        }
+                                        generate_particles(self.particles.world_size, 1)[0]
                                     })
                                     .take(particle_count - self.particles.current_particles.len()),
                                 );
@@ -258,6 +243,10 @@ impl eframe::App for App {
                         .particles
                         .world_size
                         .max(self.particles.particle_effect_radius * 2.0);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Solid Walls: ");
+                    ui.checkbox(&mut self.particles.solid_walls, "");
                 });
                 ui.horizontal(|ui| {
                     ui.label("Ticks Per Second: ");
@@ -291,7 +280,25 @@ impl eframe::App for App {
                         0.0..=1.0,
                     ));
                 });
-                self.color_window_open |= ui.button("Properties").clicked();
+                ui.horizontal(|ui| {
+                    ui.label("Gravity: ");
+                    ui.add(
+                        egui::DragValue::new(&mut self.particles.gravity.x)
+                            .prefix("x: ")
+                            .speed(0.01),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.particles.gravity.y)
+                            .prefix("y: ")
+                            .speed(0.01),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut self.particles.gravity.z)
+                            .prefix("z: ")
+                            .speed(0.01),
+                    );
+                });
+                self.color_window_open |= ui.button("Particle Properties").clicked();
                 ui.allocate_space(ui.available_size());
             });
         });
@@ -350,7 +357,7 @@ impl eframe::App for App {
                     UniformBuffer::new([0; <GpuCamera as ShaderSize>::SHADER_SIZE.get() as _]);
                 camera_uniform
                     .write(&{
-                        let axes = self.camera.compute_axes();
+                        let (forward, _, up) = self.camera.calculate_axes();
                         GpuCamera {
                             view_matrix: cgmath::Matrix4::look_to_rh(
                                 cgmath::point3(
@@ -358,8 +365,8 @@ impl eframe::App for App {
                                     self.camera.position.y,
                                     self.camera.position.z,
                                 ),
-                                axes.forward,
-                                axes.up,
+                                forward,
+                                up,
                             ),
                             projection_matrix: cgmath::perspective(
                                 cgmath::Rad::from(cgmath::Deg(90.0)),
@@ -409,9 +416,9 @@ impl eframe::App for App {
                             }),
                     ),
                 });
-            });
 
-        ctx.request_repaint();
+                ctx.request_repaint();
+            });
     }
 }
 
@@ -653,10 +660,8 @@ impl Renderer {
         queue: &wgpu::Queue,
         _encoder: &wgpu::CommandEncoder,
     ) -> Vec<wgpu::CommandBuffer> {
-        // Update camera
         queue.write_buffer(&self.camera_uniform_buffer, 0, camera);
 
-        // Update particles and colors
         {
             let mut particles_bind_group_invalidated = false;
             if self.particles_storage_buffer_size >= particles.len() {
@@ -735,7 +740,7 @@ fn main() {
             depth_buffer: 32,
             ..Default::default()
         },
-        Box::new(|cc| Box::new(App::new(cc))),
+        Box::new(|cc| Box::new(SimulationApp::new(cc))),
     )
     .unwrap();
 }
