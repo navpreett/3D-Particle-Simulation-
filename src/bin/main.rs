@@ -23,14 +23,24 @@ struct CameraSystem {
 
 impl CameraSystem {
     fn calculate_axes(&self) -> (cgmath::Vector3<f32>, cgmath::Vector3<f32>, cgmath::Vector3<f32>) {
+        let pitch_rad = self.pitch.to_radians();
+        let yaw_rad = self.yaw.to_radians();
+        
+        let pitch_cos = pitch_rad.cos();
+        let pitch_sin = pitch_rad.sin();
+        let yaw_sin = yaw_rad.sin();
+        let yaw_cos = yaw_rad.cos();
+        
         let forward = cgmath::vec3(
-            self.pitch.to_radians().cos() * self.yaw.to_radians().sin(),
-            self.pitch.to_radians().sin(),
-            -self.pitch.to_radians().cos() * self.yaw.to_radians().cos(),
+            pitch_cos * yaw_sin,
+            pitch_sin,
+            -pitch_cos * yaw_cos,
         )
         .normalize();
+        
         let right = forward.cross(self.up).normalize();
         let up = right.cross(forward).normalize();
+        
         (forward, right, up)
     }
 
@@ -48,18 +58,21 @@ impl CameraSystem {
 fn generate_particles(world_size: f32, count: usize) -> Vec<Particle> {
     (0..count)
         .into_par_iter()
-        .map(|_| {
-            let mut rng = thread_rng();
-            Particle {
-                position: cgmath::vec3(
-                    rng.gen_range(world_size * -0.5..=world_size * 0.5),
-                    rng.gen_range(world_size * -0.5..=world_size * 0.5),
-                    rng.gen_range(world_size * -0.5..=world_size * 0.5),
-                ),
-                velocity: cgmath::vec3(0.0, 0.0, 0.0),
-                id: rng.gen_range(0..MAX_PARTICLE_TYPES) as u32,
-            }
-        })
+        .map_init(
+            || rand::thread_rng(),
+            |rng, _| {
+                let half_size = world_size * 0.5;
+                Particle {
+                    position: cgmath::vec3(
+                        rng.gen_range(-half_size..=half_size),
+                        rng.gen_range(-half_size..=half_size),
+                        rng.gen_range(-half_size..=half_size),
+                    ),
+                    velocity: cgmath::vec3(0.0, 0.0, 0.0),
+                    id: rng.gen_range(0..MAX_PARTICLE_TYPES) as u32,
+                }
+            },
+        )
         .collect()
 }
 
@@ -160,8 +173,13 @@ impl eframe::App for SimulationApp {
         let start_update = std::time::Instant::now();
         if self.fixed_time.as_secs_f32() >= 1.0 / self.ticks_per_second {
             let ts = 1.0 / self.ticks_per_second;
-            self.particles.update(ts);
-            self.fixed_time -= std::time::Duration::from_secs_f32(1.0 / self.ticks_per_second);
+            let fixed_step = std::time::Duration::from_secs_f32(1.0 / self.ticks_per_second);
+            
+            let updates_needed = (self.fixed_time.as_secs_f32() * self.ticks_per_second).min(5.0) as usize;
+            for _ in 0..updates_needed {
+                self.particles.update(ts);
+                self.fixed_time -= fixed_step;
+            }
         }
         let update_elapsed = start_update.elapsed();
 
@@ -225,12 +243,11 @@ impl eframe::App for SimulationApp {
                                 self.particles.current_particles.truncate(particle_count);
                             }
                             Ordering::Greater => {
-                                self.particles.current_particles.extend(
-                                    std::iter::repeat_with(|| {
-                                        generate_particles(self.particles.world_size, 1)[0]
-                                    })
-                                    .take(particle_count - self.particles.current_particles.len()),
-                                );
+                                let additional = particle_count - self.particles.current_particles.len();
+                                self.particles.current_particles.reserve(additional);
+                                
+                                let new_particles = generate_particles(self.particles.world_size, additional);
+                                self.particles.current_particles.extend(new_particles);
                             }
                             Ordering::Equal => {}
                         }
@@ -661,51 +678,59 @@ impl Renderer {
         _encoder: &wgpu::CommandEncoder,
     ) -> Vec<wgpu::CommandBuffer> {
         queue.write_buffer(&self.camera_uniform_buffer, 0, camera);
-
-        {
-            let mut particles_bind_group_invalidated = false;
-            if self.particles_storage_buffer_size >= particles.len() {
-                queue.write_buffer(&self.particles_storage_buffer, 0, particles);
-            } else {
-                particles_bind_group_invalidated = true;
-                self.particles_storage_buffer =
-                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Particles Storage Buffer"),
-                        contents: particles,
-                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
-                    });
-                self.particles_storage_buffer_size = particles.len();
-            }
-            if self.colors_storage_buffer_size >= particles.len() {
-                queue.write_buffer(&self.colors_storage_buffer, 0, colors);
-            } else {
-                particles_bind_group_invalidated = true;
-                self.colors_storage_buffer =
-                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("Particles Storage Buffer"),
-                        contents: colors,
-                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
-                    });
-                self.colors_storage_buffer_size = colors.len();
-            }
-            if particles_bind_group_invalidated {
-                self.particles_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("Particles Bind Group"),
-                    layout: &self.particles_bind_group_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: self.particles_storage_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: self.colors_storage_buffer.as_entire_binding(),
-                        },
-                    ],
-                });
-            }
+        
+        let mut particles_bind_group_invalidated = false;
+        
+        let aligned_particles_len = (particles.len() + 3) & !3; 
+        if self.particles_storage_buffer_size < aligned_particles_len {
+            let new_size = ((aligned_particles_len as f32 * 1.2) as usize + 3) & !3;
+            particles_bind_group_invalidated = true;
+            
+            self.particles_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Particles Storage Buffer"),
+                size: new_size as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            
+            self.particles_storage_buffer_size = new_size;
         }
-
+        
+        let aligned_colors_len = (colors.len() + 3) & !3;
+        if self.colors_storage_buffer_size < aligned_colors_len {
+            let new_size = ((aligned_colors_len as f32 * 1.2) as usize + 3) & !3;
+            particles_bind_group_invalidated = true;
+            
+            self.colors_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Colors Storage Buffer"),
+                size: new_size as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            
+            self.colors_storage_buffer_size = new_size;
+        }
+        
+        queue.write_buffer(&self.particles_storage_buffer, 0, particles);
+        queue.write_buffer(&self.colors_storage_buffer, 0, colors);
+        
+        if particles_bind_group_invalidated {
+            self.particles_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Particles Bind Group"),
+                layout: &self.particles_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.particles_storage_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.colors_storage_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+        }
+    
         vec![]
     }
 
@@ -724,7 +749,7 @@ impl Renderer {
 
 fn main() {
     eframe::run_native(
-        "Particle Physics 3D",
+        "3D Particle",
         eframe::NativeOptions {
             renderer: eframe::Renderer::Wgpu,
             wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
