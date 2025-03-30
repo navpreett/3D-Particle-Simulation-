@@ -163,6 +163,7 @@ impl SimulationApp {
     }
 }
 
+
 impl eframe::App for SimulationApp {
     fn update(&mut self, ctx: &eframe::egui::Context, _frame: &mut eframe::Frame) {
         let time = std::time::Instant::now();
@@ -735,15 +736,17 @@ impl Renderer {
     }
 
     fn paint<'a>(&'a self, sphere_count: u32, render_pass: &mut wgpu::RenderPass<'a>) {
+        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        render_pass.set_bind_group(1, &self.particles_bind_group, &[]);
+        
         render_pass.set_pipeline(&self.particles_render_pipeline);
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.particles_bind_group, &[]);
         render_pass.draw(0..4, 0..sphere_count);
-
-        render_pass.set_pipeline(&self.border_render_pipeline);
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.particles_bind_group, &[]);
-        render_pass.draw(0..24, 0..1);
+        
+        if sphere_count > 0 {
+            render_pass.set_pipeline(&self.border_render_pipeline);
+            
+            render_pass.draw(0..24, 0..1);
+        }
     }
 }
 

@@ -143,67 +143,68 @@ impl Particles {
         std::mem::swap(&mut self.current_particles, &mut self.previous_particles);
         self.current_particles.clear();
         
+        let offsets: Vec<_> = (-1..=1)
+            .flat_map(|x_offset| {
+                (-1..=1).flat_map(move |y_offset| {
+                    (-1..=1).map(move |z_offset| {
+                        (x_offset, y_offset, z_offset)
+                    })
+                })
+            })
+            .collect();
+
         self.current_particles = self.previous_particles
             .par_iter()
             .map(|&particle| {
                 let mut updated_particle = particle;
                 
-                let total_force = (-1..=1)
-                    .into_par_iter()
-                    .flat_map(|x_offset| {
-                        (-1..=1).into_par_iter().flat_map(move |y_offset| {
-                            (-1..=1).into_par_iter().map(move |z_offset| {
-                                (x_offset, y_offset, z_offset)
-                            })
-                        })
-                    })
-                    .fold(
-                        || cgmath::Vector3::zero(), 
-                        |mut acc, (x_offset, y_offset, z_offset)| {
-                            let offset = cgmath::vec3(x_offset as _, y_offset as _, z_offset as _)
-                                * self.world_size;
-                            let cell = self.cell_coord(updated_particle.position + offset);
+                let total_force = offsets
+                    .par_iter()
+                    .map(|&(x_offset, y_offset, z_offset)| {
+                        let mut force = cgmath::Vector3::zero();
+                        let offset = cgmath::vec3(x_offset as f32, y_offset as f32, z_offset as f32)
+                            * self.world_size;
+                        let cell = self.cell_coord(updated_particle.position + offset);
 
-                            for x_cell_offset in -1..=1 {
-                                for y_cell_offset in -1..=1 {
-                                    for z_cell_offset in -1..=1 {
-                                        let cell = cell
-                                            + cgmath::vec3(x_cell_offset, y_cell_offset, z_cell_offset);
+                        for x_cell_offset in -1..=1 {
+                            for y_cell_offset in -1..=1 {
+                                for z_cell_offset in -1..=1 {
+                                    let neighbor_cell = cell
+                                        + cgmath::vec3(x_cell_offset, y_cell_offset, z_cell_offset);
 
-                                        let index = Self::hash_cell(cell) % hash_table_length;
-                                        for index in &particle_indices[hash_table[index]
-                                            .load(Relaxed)
-                                            ..hash_table[index + 1].load(Relaxed)]
+                                    let cell_hash = Self::hash_cell(neighbor_cell) % hash_table_length;
+                                    let start = hash_table[cell_hash].load(Relaxed);
+                                    let end = hash_table[cell_hash + 1].load(Relaxed);
+                                    
+                                    for index in start..end {
+                                        let other_particle_idx = particle_indices[index].load(Relaxed);
+                                        let other_particle = &self.previous_particles[other_particle_idx];
+
+                                        let relative_position = other_particle.position
+                                            - (updated_particle.position + offset);
+                                        let sqr_distance = relative_position.magnitude2();
+                                        
+                                        if sqr_distance > 0.0
+                                            && sqr_distance
+                                                < self.particle_effect_radius
+                                                    * self.particle_effect_radius
                                         {
-                                            let other_particle =
-                                                &self.previous_particles[index.load(Relaxed)];
-
-                                            let relative_position = other_particle.position
-                                                - (updated_particle.position + offset);
-                                            let sqr_distance = relative_position.magnitude2();
-                                            
-                                            if sqr_distance > 0.0
-                                                && sqr_distance
-                                                    < self.particle_effect_radius
-                                                        * self.particle_effect_radius
-                                            {
-                                                let distance = sqr_distance.sqrt();
-                                                let f = self.calculate_force(
-                                                    distance,
-                                                    self.attraction_matrix[(updated_particle.id
-                                                        * self.id_count
-                                                        + other_particle.id)
-                                                        as usize],
-                                                );
-                                                acc += relative_position / distance * f;
-                                            }
+                                            let distance = sqr_distance.sqrt();
+                                            let f = self.calculate_force(
+                                                distance / self.particle_effect_radius,
+                                                self.attraction_matrix[(updated_particle.id
+                                                    * self.id_count
+                                                    + other_particle.id)
+                                                    as usize],
+                                            );
+                                            force += relative_position / distance * f;
                                         }
                                     }
                                 }
                             }
-                            acc
                         }
-                    )
+                        force
+                    })
                     .reduce(
                         || cgmath::Vector3::zero(), 
                         |a, b| a + b
