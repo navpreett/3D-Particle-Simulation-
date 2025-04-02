@@ -4,27 +4,32 @@ struct Particle {
     id: u32,
 };
 
+//holds all particle data
 struct Particles {
     world_size: f32,
     length: u32,
     particles: array<Particle>,
 };
 
+//stores color info
 struct Colors {
     length: u32,
     colors: array<vec3<f32>>,
 };
 
+//camera matrices
 struct Camera {
     view_matrix: mat4x4<f32>,
     projection_matrix: mat4x4<f32>,
 };
 
+//shader inputs
 struct VertexIn {
     @builtin(vertex_index) vertex_index: u32,
-    @builtin(instance_index) particle_index: u32,
+    @builtin(instance_index) particle_index: u32, // parallel processing
 };
 
+//data passed to fragment shader
 struct VertexOut {
     @builtin(position) position: vec4<f32>,
     @location(0) world_position: vec3<f32>,
@@ -40,7 +45,7 @@ struct VertexOut {
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let distance = length(in.uv * 2.0 - 1.0);
     if distance > 1.0 {
-        discard;
+        discard; //fast because skips pixel calculation
     }
     
     let particle_id = particles.particles[in.particle_index].id;
@@ -52,8 +57,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
 @vertex
 fn vs_main(in: VertexIn) -> VertexOut {
     let vertex_index = in.vertex_index;
-    let particle_index = in.particle_index;
+    let particle_index = in.particle_index; //concurrent processing here
     
+        //fast bit operations for uv calculation
     let u = f32((vertex_index >> 0u) & 1u);
     let v = f32((vertex_index >> 1u) & 1u);
     let uv = vec2(u, v);
@@ -61,6 +67,7 @@ fn vs_main(in: VertexIn) -> VertexOut {
     let particle_pos = particles.particles[particle_index].position;
     let view_space_pos = camera.view_matrix * vec4(particle_pos, 1.0);
     
+        //quick billboard calculation without full matrix math
     let offset = vec4((uv - 0.5) * 0.1, 0.0, 0.0);
     let final_view_pos = view_space_pos + offset;
     
