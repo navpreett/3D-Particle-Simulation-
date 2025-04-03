@@ -365,61 +365,50 @@ impl eframe::App for SimulationApp {
         });
 
         egui::Window::new("Properties")
-            .open(&mut self.window)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let size = ui.spacing().interact_size;
-                    ui.allocate_exact_size(size, egui::Sense::hover());
-
-                    // showing color buttons for each particle type in a row
-                    for i in 0..self.particles.id_count {
-                        let mut ui_color = [
-                            self.particles.colors[i as usize].x,
-                            self.particles.colors[i as usize].y,
-                            self.particles.colors[i as usize].z,
-                        ];
-                        ui.color_edit_button_rgb(&mut ui_color);//color picker button
-                        self.particles.colors[i as usize] =
-                            //updating particle color
-                            cgmath::vec3(ui_color[0], ui_color[1], ui_color[2]);
-                    }
-                });
-                //creating a full attraction matrix editor
-                for i in 0..self.particles.id_count {
-                    ui.horizontal(|ui| {
-                        let mut ui_color = [
-                            self.particles.colors[i as usize].x,
-                            self.particles.colors[i as usize].y,
-                            self.particles.colors[i as usize].z,
-                        ];
-                        //showing color of this row
-                        ui.color_edit_button_rgb(&mut ui_color);
-                        self.particles.colors[i as usize] =
-                            cgmath::vec3(ui_color[0], ui_color[1], ui_color[2]);
-                        //for each particle type, I added slider to set attraction/repulsion
-                        for j in 0..self.particles.id_count {
-                            ui.add(
-                                egui::DragValue::new(
-                                    &mut self.particles.attraction_matrix
-                                        [(i * self.particles.id_count + j) as usize],
-                                )
-                                .clamp_range(-1.0..=1.0)//limited values between -1 and 1
-                                .speed(0.01),//controlled adjustment speed
-                            );
-                        }
-                    });
+        .open(&mut self.window)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                for i in 0..self.particles.id_count as usize {
+                    let mut ui_color = [
+                        self.particles.colors[i].x,
+                        self.particles.colors[i].y,
+                        self.particles.colors[i].z,
+                    ];
+                    ui.color_edit_button_rgb(&mut ui_color);
+                    self.particles.colors[i] = cgmath::vec3(ui_color[0], ui_color[1], ui_color[2]);
                 }
             });
+            
+            for i in 0..self.particles.id_count as usize {
+                ui.horizontal(|ui| {
+                    // Show color for this row
+                    let mut ui_color = [
+                        self.particles.colors[i].x,
+                        self.particles.colors[i].y,
+                        self.particles.colors[i].z,
+                    ];
+                    ui.color_edit_button_rgb(&mut ui_color);
+                    self.particles.colors[i] = cgmath::vec3(ui_color[0], ui_color[1], ui_color[2]);
+                    
+                    //attraction/repulsion sliders for each particle type
+                    for j in 0..self.particles.id_count as usize {
+                        ui.add(
+                            egui::DragValue::new(&mut self.particles.attraction_matrix[i * self.particles.id_count as usize + j])
+                                .clamp_range(-1.0..=1.0)
+                                .speed(0.01)
+                        );
+                    }
+                });
+            }
+        });
         //created the main 3d view panel
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(ctx.style().visuals.panel_fill))
             .show(ctx, |ui| {
-                                // used all available space for the 3d view
                 let (rect, _response) =
                     ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
 
-                                    // set up camera data for the gpu
                 let mut camera_uniform =
                     UniformBuffer::new([0; <GpuCamera as ShaderSize>::SHADER_SIZE.get() as _]);
                 camera_uniform
@@ -479,12 +468,12 @@ impl eframe::App for SimulationApp {
                                 let renderer: &mut Renderer =
                                     paint_callback_resources.get_mut().unwrap();
                                 renderer
-                                    .prepare(&camera, &particles, &colors, device, queue, encoder)
+                                    .update_resources(&camera, &particles, &colors, device, queue, encoder)
                             })
                             //rendering
                             .paint(move |_info, render_pass, paint_callback_resources| {
                                 let renderer: &Renderer = paint_callback_resources.get().unwrap();
-                                renderer.paint(sphere_count as _, render_pass);
+                                renderer.render(sphere_count as _, render_pass);
                             }),
                     ),
                 });
@@ -686,39 +675,51 @@ impl Renderer {
                 });
 
         //setting up how box borders will be drawn
-        let border_render_pipeline =
+        let border_render_pipeline = {
+            let vertex_state = wgpu::VertexState {
+                module: &border_shader,
+                entry_point: "vs_main",
+                buffers: &[],
+            };
+        
+            let fragment_state = wgpu::FragmentState {
+                module: &border_shader,
+                entry_point: "fs_main",
+                targets: &[Some(render_state.target_format.into())],
+            };
+        
+            let primitive_state = wgpu::PrimitiveState {
+                polygon_mode: wgpu::PolygonMode::Line,
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            };
+        
+            let depth_stencil_state = wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            };
+        
+            let multisample_state = wgpu::MultisampleState {
+                ..Default::default()
+            };
+        
             render_state
                 .device
                 .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some("Border Render Pipeline"),
                     layout: Some(&border_pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &border_shader,
-                        entry_point: "vs_main",
-                        buffers: &[],
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &border_shader,
-                        entry_point: "fs_main",
-                        targets: &[Some(render_state.target_format.into())],
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        polygon_mode: wgpu::PolygonMode::Line,
-                        topology: wgpu::PrimitiveTopology::LineList,
-                        ..Default::default()
-                    },
-                    depth_stencil: Some(wgpu::DepthStencilState {
-                        format: wgpu::TextureFormat::Depth32Float,
-                        depth_write_enabled: true,
-                        depth_compare: wgpu::CompareFunction::Less,
-                        stencil: wgpu::StencilState::default(),
-                        bias: wgpu::DepthBiasState::default(),
-                    }),
-                    multisample: wgpu::MultisampleState {
-                        ..Default::default()
-                    },
+                    vertex: vertex_state,
+                    fragment: Some(fragment_state),
+                    primitive: primitive_state,
+                    depth_stencil: Some(depth_stencil_state),
+                    multisample: multisample_state,
                     multiview: None,
-                });
+                })
+        };
+        
 
         //collecting all the gpu memory and rendering pipelines
         Self {
@@ -736,58 +737,65 @@ impl Renderer {
     }
 
      //updating camera data on gpu
-    fn prepare(
+     fn update_resources(
         &mut self,
-        camera: &[u8],
-        particles: &[u8],
-        colors: &[u8],
+        camera_data: &[u8],
+        particle_data: &[u8],
+        color_data: &[u8],
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _encoder: &wgpu::CommandEncoder,
+        _cmd_encoder: &wgpu::CommandEncoder,
     ) -> Vec<wgpu::CommandBuffer> {
-        queue.write_buffer(&self.camera_uniform_buffer, 0, camera);
-        //resized particle buffer leading to good speed up to avoid frequent resizing
-        let mut particles_bind_group_invalidated = false;
+        //update camera
+        queue.write_buffer(&self.camera_uniform_buffer, 0, camera_data);
         
-        let aligned_particles_len = (particles.len() + 3) & !3; 
-        if self.particles_storage_buffer_size < aligned_particles_len {
-            let new_size = ((aligned_particles_len as f32 * 1.2) as usize + 3) & !3;
-            particles_bind_group_invalidated = true;
+        //track if we need to recreate the bind group
+        let mut needs_bind_group_update = false;
+        
+        //handle particle buffer resizing with memory alignment to 4 bytes
+        let particle_size_aligned = (particle_data.len() + 3) & !3;
+        if self.particles_storage_buffer_size < particle_size_aligned {
+            //apply growth factor of 1.2 to reduce future reallocations
+            let target_size = ((particle_size_aligned as f32 * 1.2) as usize + 3) & !3;
             
+            //create new buffer with increased capacity
             self.particles_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Particles Storage Buffer"),
-                size: new_size as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
+                label: Some("Particle Data Buffer"),
+                size: target_size as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
             
-            self.particles_storage_buffer_size = new_size;
+            self.particles_storage_buffer_size = target_size;
+            needs_bind_group_update = true;
         }
-
-        //resized color buffer leading to better performance
-        let aligned_colors_len = (colors.len() + 3) & !3;
-        if self.colors_storage_buffer_size < aligned_colors_len {
-            let new_size = ((aligned_colors_len as f32 * 1.2) as usize + 3) & !3;
-            particles_bind_group_invalidated = true;
-            
-            self.colors_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Colors Storage Buffer"),
-                size: new_size as wgpu::BufferAddress,
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-            
-            self.colors_storage_buffer_size = new_size;
-        }
-
-        //updated particles and colors data on gpu which is fast because it is sending data in bulk        
-        queue.write_buffer(&self.particles_storage_buffer, 0, particles);
-        queue.write_buffer(&self.colors_storage_buffer, 0, colors);
         
-        //recreated bind group if buffers changed then saves it to gpu work
-        if particles_bind_group_invalidated {
+        //similar process for color buffer resizing
+        let color_size_aligned = (color_data.len() + 3) & !3;
+        if self.colors_storage_buffer_size < color_size_aligned {
+            //calculate new buffer size with growth factor
+            let target_size = ((color_size_aligned as f32 * 1.2) as usize + 3) & !3;
+            
+            //allocate new color buffer
+            self.colors_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Particle Color Buffer"),
+                size: target_size as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            
+            self.colors_storage_buffer_size = target_size;
+            needs_bind_group_update = true;
+        }
+        
+        //transfer the actual data to GPU memory
+        queue.write_buffer(&self.particles_storage_buffer, 0, particle_data);
+        queue.write_buffer(&self.colors_storage_buffer, 0, color_data);
+        
+        //regenerate bind group if buffer references changed
+        if needs_bind_group_update {
             self.particles_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Particles Bind Group"),
+                label: Some("Particle System Bind Group"),
                 layout: &self.particles_bind_group_layout,
                 entries: &[
                     wgpu::BindGroupEntry {
@@ -801,25 +809,27 @@ impl Renderer {
                 ],
             });
         }
-    
-        vec![]
+        
+        Vec::new()
     }
+        
+
+        
 
         //telling gpu which camera and particle data to use
-    fn paint<'a>(&'a self, sphere_count: u32, render_pass: &mut wgpu::RenderPass<'a>) {
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.particles_bind_group, &[]);
-        //drawing all particles at once for faster speed up because gpu handles all particles in parallel
-        render_pass.set_pipeline(&self.particles_render_pipeline);
-        render_pass.draw(0..4, 0..sphere_count);
-        
-        //drawing box border if there is any particles left
-        if sphere_count > 0 {
-            render_pass.set_pipeline(&self.border_render_pipeline);
+        fn render<'a>(&'a self, particle_instances: u32, pass: &mut wgpu::RenderPass<'a>) {
+            pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            pass.set_bind_group(1, &self.particles_bind_group, &[]);
             
-            render_pass.draw(0..24, 0..1);
+            if particle_instances > 0 {
+                // First render the container borders
+                pass.set_pipeline(&self.border_render_pipeline);
+                pass.draw(0..24, 0..1);
+                
+                pass.set_pipeline(&self.particles_render_pipeline);
+                pass.draw(0..4, 0..particle_instances);
+            }
         }
-    }
 }
 
 fn main() {
